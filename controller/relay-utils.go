@@ -1,30 +1,61 @@
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/pkoukk/tiktoken-go"
+	"io"
+	"net/http"
 	"one-api/common"
+	"strconv"
+	"strings"
 )
 
 var stopFinishReason = "stop"
 
+// tokenEncoderMap won't grow after initialization
 var tokenEncoderMap = map[string]*tiktoken.Tiktoken{}
+var defaultTokenEncoder *tiktoken.Tiktoken
 
-func getTokenEncoder(model string) *tiktoken.Tiktoken {
-	if tokenEncoder, ok := tokenEncoderMap[model]; ok {
-		return tokenEncoder
-	}
-	tokenEncoder, err := tiktoken.EncodingForModel(model)
+func InitTokenEncoders() {
+	common.SysLog("initializing token encoders")
+	gpt35TokenEncoder, err := tiktoken.EncodingForModel("gpt-3.5-turbo")
 	if err != nil {
-		common.SysError(fmt.Sprintf("failed to get token encoder for model %s: %s, using encoder for gpt-3.5-turbo", model, err.Error()))
-		tokenEncoder, err = tiktoken.EncodingForModel("gpt-3.5-turbo")
-		if err != nil {
-			common.FatalLog(fmt.Sprintf("failed to get token encoder for model gpt-3.5-turbo: %s", err.Error()))
+		common.FatalLog(fmt.Sprintf("failed to get gpt-3.5-turbo token encoder: %s", err.Error()))
+	}
+	defaultTokenEncoder = gpt35TokenEncoder
+	gpt4TokenEncoder, err := tiktoken.EncodingForModel("gpt-4")
+	if err != nil {
+		common.FatalLog(fmt.Sprintf("failed to get gpt-4 token encoder: %s", err.Error()))
+	}
+	for model, _ := range common.ModelRatio {
+		if strings.HasPrefix(model, "gpt-3.5") {
+			tokenEncoderMap[model] = gpt35TokenEncoder
+		} else if strings.HasPrefix(model, "gpt-4") {
+			tokenEncoderMap[model] = gpt4TokenEncoder
+		} else {
+			tokenEncoderMap[model] = nil
 		}
 	}
-	tokenEncoderMap[model] = tokenEncoder
-	return tokenEncoder
+	common.SysLog("token encoders initialized")
+}
+
+func getTokenEncoder(model string) *tiktoken.Tiktoken {
+	tokenEncoder, ok := tokenEncoderMap[model]
+	if ok && tokenEncoder != nil {
+		return tokenEncoder
+	}
+	if ok {
+		tokenEncoder, err := tiktoken.EncodingForModel(model)
+		if err != nil {
+			common.SysError(fmt.Sprintf("failed to get token encoder for model %s: %s, using encoder for gpt-3.5-turbo", model, err.Error()))
+			tokenEncoder = defaultTokenEncoder
+		}
+		tokenEncoderMap[model] = tokenEncoder
+		return tokenEncoder
+	}
+	return defaultTokenEncoder
 }
 
 func getTokenNum(tokenEncoder *tiktoken.Tiktoken, text string) int {
@@ -95,12 +126,15 @@ func errorWrapper(err error, code string, statusCode int) *OpenAIErrorWithStatus
 	}
 }
 
-func shouldDisableChannel(err *OpenAIError) bool {
+func shouldDisableChannel(err *OpenAIError, statusCode int) bool {
 	if !common.AutomaticDisableChannelEnabled {
 		return false
 	}
 	if err == nil {
 		return false
+	}
+	if statusCode == http.StatusUnauthorized {
+		return true
 	}
 	if err.Type == "insufficient_quota" || err.Code == "invalid_api_key" || err.Code == "account_deactivated" {
 		return true
@@ -114,4 +148,41 @@ func setEventStreamHeaders(c *gin.Context) {
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("Transfer-Encoding", "chunked")
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
+}
+
+func relayErrorHandler(resp *http.Response) (openAIErrorWithStatusCode *OpenAIErrorWithStatusCode) {
+	openAIErrorWithStatusCode = &OpenAIErrorWithStatusCode{
+		StatusCode: resp.StatusCode,
+		OpenAIError: OpenAIError{
+			Message: fmt.Sprintf("bad response status code %d", resp.StatusCode),
+			Type:    "upstream_error",
+			Code:    "bad_response_status_code",
+			Param:   strconv.Itoa(resp.StatusCode),
+		},
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	err = resp.Body.Close()
+	if err != nil {
+		return
+	}
+	var textResponse TextResponse
+	err = json.Unmarshal(responseBody, &textResponse)
+	if err != nil {
+		return
+	}
+	openAIErrorWithStatusCode.OpenAIError = textResponse.Error
+	return
+}
+
+func getFullRequestURL(baseURL string, requestURL string, channelType int) string {
+	fullRequestURL := fmt.Sprintf("%s%s", baseURL, requestURL)
+	if channelType == common.ChannelTypeOpenAI {
+		if strings.HasPrefix(baseURL, "https://gateway.ai.cloudflare.com") {
+			fullRequestURL = fmt.Sprintf("%s%s", baseURL, strings.TrimPrefix(requestURL, "/v1"))
+		}
+	}
+	return fullRequestURL
 }

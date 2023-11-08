@@ -226,17 +226,16 @@ func IsAdmin(userId int) bool {
 	return user.Role >= common.RoleAdminUser
 }
 
-func IsUserEnabled(userId int) bool {
+func IsUserEnabled(userId int) (bool, error) {
 	if userId == 0 {
-		return false
+		return false, errors.New("user id is empty")
 	}
 	var user User
 	err := DB.Where("id = ?", userId).Select("status").Find(&user).Error
 	if err != nil {
-		common.SysError("no such user " + err.Error())
-		return false
+		return false, err
 	}
-	return user.Status == common.UserStatusEnabled
+	return user.Status == common.UserStatusEnabled, nil
 }
 
 func ValidateAccessToken(token string) (user *User) {
@@ -267,7 +266,12 @@ func GetUserEmail(id int) (email string, err error) {
 }
 
 func GetUserGroup(id int) (group string, err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Select("`group`").Find(&group).Error
+	groupCol := "`group`"
+	if common.UsingPostgreSQL {
+		groupCol = `"group"`
+	}
+
+	err = DB.Model(&User{}).Where("id = ?", id).Select(groupCol).Find(&group).Error
 	return group, err
 }
 
@@ -275,6 +279,14 @@ func IncreaseUserQuota(id int, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
+		return nil
+	}
+	return increaseUserQuota(id, quota)
+}
+
+func increaseUserQuota(id int, quota int) (err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
 	return err
 }
@@ -283,6 +295,14 @@ func DecreaseUserQuota(id int, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
+		return nil
+	}
+	return decreaseUserQuota(id, quota)
+}
+
+func decreaseUserQuota(id int, quota int) (err error) {
 	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota - ?", quota)).Error
 	return err
 }
@@ -293,14 +313,41 @@ func GetRootUserEmail() (email string) {
 }
 
 func UpdateUserUsedQuotaAndRequestCount(id int, quota int) {
+	if common.BatchUpdateEnabled {
+		addNewRecord(BatchUpdateTypeUsedQuota, id, quota)
+		addNewRecord(BatchUpdateTypeRequestCount, id, 1)
+		return
+	}
+	updateUserUsedQuotaAndRequestCount(id, quota, 1)
+}
+
+func updateUserUsedQuotaAndRequestCount(id int, quota int, count int) {
 	err := DB.Model(&User{}).Where("id = ?", id).Updates(
 		map[string]interface{}{
 			"used_quota":    gorm.Expr("used_quota + ?", quota),
-			"request_count": gorm.Expr("request_count + ?", 1),
+			"request_count": gorm.Expr("request_count + ?", count),
 		},
 	).Error
 	if err != nil {
 		common.SysError("failed to update user used quota and request count: " + err.Error())
+	}
+}
+
+func updateUserUsedQuota(id int, quota int) {
+	err := DB.Model(&User{}).Where("id = ?", id).Updates(
+		map[string]interface{}{
+			"used_quota": gorm.Expr("used_quota + ?", quota),
+		},
+	).Error
+	if err != nil {
+		common.SysError("failed to update user used quota: " + err.Error())
+	}
+}
+
+func updateUserRequestCount(id int, count int) {
+	err := DB.Model(&User{}).Where("id = ?", id).Update("request_count", gorm.Expr("request_count + ?", count)).Error
+	if err != nil {
+		common.SysError("failed to update user request count: " + err.Error())
 	}
 }
 
